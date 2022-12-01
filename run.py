@@ -43,7 +43,9 @@ class run():
             save_dir (str, optinal): The path to save trained models. If set to :obj:`''`, will not save the model. (default: :obj:`''`)
             log_dir (str, optinal): The path to save log files. If set to :obj:`''`, will not save the log files. (default: :obj:`''`)
         
-        """        
+        """
+        if args.target == 'task1':
+            tasks = ['homo', 'lumo', 'gap']
 
         model = model.to(device)
         num_params = sum(p.numel() for p in model.parameters())
@@ -71,25 +73,27 @@ class run():
             print("\n=====Epoch {}".format(epoch), flush=True)
             
             print('\nTraining...', flush=True)
-            train_mae = self.train(model, optimizer, train_loader, energy_and_force, p, loss_func, device)
+            train_mae = self.train(model, optimizer, train_loader, energy_and_force, p, loss_func, device, args.target)
 
             print('\n\nEvaluating...', flush=True)
-            valid_mae = self.val(model, valid_loader, energy_and_force, p, evaluation, device)
+            valid_mae = self.val(model, valid_loader, energy_and_force, p, evaluation, device, args.target)
 
             print('\n\nTesting...', flush=True)
-            test_mae = self.val(model, test_loader, energy_and_force, p, evaluation, device)
+            test_mae = self.val(model, test_loader, energy_and_force, p, evaluation, device, args.target)
 
             print()
             print({'Train': train_mae, 'Validation': valid_mae, 'Test': test_mae})
 
             if log_dir != '':
-                writer.add_scalar('train_mae', train_mae, epoch)
-                writer.add_scalar('valid_mae', valid_mae, epoch)
-                writer.add_scalar('test_mae', test_mae, epoch)
-            
+                for task in tasks:
+                    writer.add_scalar(task + '_train_mae', train_mae, epoch)
+                    writer.add_scalar(task + '_valid_mae', valid_mae[task + '_mae'], epoch)
+                    writer.add_scalar(task + '_test_mae', test_mae[task + '_mae'], epoch)
+
+            valid_mae = sum(valid_mae[task+'_mae'] for task in tasks)
             if valid_mae < best_valid and (epoch%10 == 0 or epoch == args.num_epochs):
                 best_valid = valid_mae
-                best_test = test_mae
+                best_test = sum(test_mae[task+'_mae'] for task in tasks)
                 if save_dir != '':
                     print('Saving checkpoint...')
                     checkpoint = {'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(), 'best_valid_mae': best_valid, 'num_params': num_params}
@@ -103,7 +107,7 @@ class run():
         if log_dir != '':
             writer.close()
 
-    def train(self, model, optimizer, train_loader, energy_and_force, p, loss_func, device):
+    def train(self, model, optimizer, train_loader, energy_and_force, p, loss_func, device, target):
         r"""
         The script for training.
         
@@ -118,26 +122,32 @@ class run():
 
         :rtype: Traning loss. ( :obj:`mae`)
         
-        """   
+        """
         model.train()
         loss_accum = 0
         for step, batch_data in enumerate(tqdm(train_loader)):
             optimizer.zero_grad()
             batch_data = batch_data.to(device)
-            out = model(batch_data)
+            out = model(batch_data, target)
             if energy_and_force:
                 force = -grad(outputs=out, inputs=batch_data.pos, grad_outputs=torch.ones_like(out),create_graph=True,retain_graph=True)[0]
                 e_loss = loss_func(out, batch_data.y.unsqueeze(1))
                 f_loss = loss_func(force, batch_data.force)
                 loss = e_loss + p * f_loss
             else:
-                loss = loss_func(out, batch_data.y.unsqueeze(1))
+                #loss = loss_func(out, batch_data.y.unsqueeze(1))
+                if target == 'task1':
+                    homo_loss = loss_func(out[:,0], batch_data.y[:,0])
+                    lumo_loss = loss_func(out[:,1], batch_data.y[:,1])
+                    gap_loss = loss_func(out[:,2], batch_data.y[:,2])
+                    loss = (homo_loss + lumo_loss + gap_loss)/3
+
             loss.backward()
             optimizer.step()
             loss_accum += loss.detach().cpu().item()
         return loss_accum / (step + 1)
 
-    def val(self, model, data_loader, energy_and_force, p, evaluation, device):
+    def val(self, model, data_loader, energy_and_force, p, evaluation, device ,target):
         r"""
         The script for validation/test.
         
@@ -152,6 +162,8 @@ class run():
         :rtype: Evaluation result. ( :obj:`mae`)
         
         """   
+        if target == 'task1':
+            tasks = ['homo', 'lumo', 'gap']
         model.eval()
 
         preds = torch.Tensor([]).to(device)
@@ -163,15 +175,30 @@ class run():
         
         for step, batch_data in enumerate(tqdm(data_loader)):
             batch_data = batch_data.to(device)
-            out = model(batch_data)
+            out = model(batch_data, target)
             if energy_and_force:
                 force = -grad(outputs=out, inputs=batch_data.pos, grad_outputs=torch.ones_like(out),create_graph=True,retain_graph=True)[0]
                 preds_force = torch.cat([preds_force,force.detach_()], dim=0)
                 targets_force = torch.cat([targets_force,batch_data.force], dim=0)
-            preds = torch.cat([preds, out.detach_()], dim=0)
-            targets = torch.cat([targets, batch_data.y.unsqueeze(1)], dim=0)
+            if target == 'task1':
+                p = torch.Tensor([]).to(device)
+                p = torch.cat([p, torch.unsqueeze(out[:,0], dim=1).detach()], dim=0)
+                p = torch.cat([p, torch.unsqueeze(out[:,1], dim=1).detach()], dim=1)
+                p = torch.cat([p, torch.unsqueeze(out[:,2], dim=1).detach()], dim=1)
+                p = p.reshape([p.shape[0], p.shape[1], 1])
+                preds = torch.cat([preds, p], dim=0)
 
-        input_dict = {"y_true": targets, "y_pred": preds}
+                t = batch_data.y.reshape(batch_data.y.shape[0], batch_data.y.shape[1], 1)
+                targets = torch.cat([targets, t], dim=0)
+
+       #     preds = torch.cat([preds, out.detach_()], dim=0)
+        #    targets = torch.cat([targets, batch_data.y.unsqueeze(1)], dim=0)
+
+        input_dict = {}
+        for i in range(len(tasks)):
+            input_dict[tasks[i]+'_y_true'] = targets[:, i]
+            input_dict[tasks[i]+'_y_pred'] = preds[:, i]
+    #    input_dict = {"y_true": targets, "y_pred": preds}
 
         if energy_and_force:
             input_dict_force = {"y_true": targets_force, "y_pred": preds_force}
@@ -180,4 +207,4 @@ class run():
             print({'Energy MAE': energy_mae, 'Force MAE': force_mae})
             return energy_mae + p * force_mae
 
-        return evaluation.eval(input_dict)['mae']
+        return evaluation.eval(input_dict, tasks)

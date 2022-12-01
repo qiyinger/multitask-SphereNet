@@ -1,7 +1,7 @@
 import argparse
 
 from dig.threedgraph.dataset import QM93D
-from dig.threedgraph.method import SphereNet
+from spherenet import SphereNet
 from dig.threedgraph.evaluation import ThreeDEvaluator
 import run
 import torch
